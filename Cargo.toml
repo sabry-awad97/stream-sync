@@ -2,6 +2,7 @@
 name = "stream-sync"
 version = "0.1.0"
 edition = "2021"
+authors = ["Dr. Sabry Awad <dr.sabry1997@gmail.com>"]
 
 [dependencies]
 tokio = { version = "1.35.0", features = ["full"] }

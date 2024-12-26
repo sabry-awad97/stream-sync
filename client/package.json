@@ -8,7 +8,7 @@
     "dev": "cross-env tsx ."
   },
   "keywords": [],
-  "author": "",
+  "author": "Dr. Sabry Awad <dr.sabry1997@gmail.com>",
   "license": "ISC",
   "dependencies": {
     "ws": "^8.16.0"

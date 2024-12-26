@@ -5,7 +5,8 @@
   "main": "src/index.ts",
   "type": "module",
   "scripts": {
-    "dev": "cross-env tsx ."
+    "dev": "cross-env tsx .",
+    "typecheck": "npx tsc --noEmit"
   },
   "keywords": [],
   "author": "Dr. Sabry Awad <dr.sabry1997@gmail.com>",

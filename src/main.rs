@@ -1,195 +1,211 @@
 use colored::*;
 use futures_util::{SinkExt, StreamExt};
-use std::{sync::Arc, time::Duration};
-use tokio::{
-    net::TcpListener,
-    sync::{broadcast, Mutex},
-    time::sleep,
-};
-use tokio_tungstenite::accept_async;
+use std::{io, time::Duration};
+use thiserror::Error;
+use tokio::{sync::mpsc, time::sleep};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use url::Url;
 
-#[derive(Debug)]
-struct ServerState {
-    active_connections: i32,
+#[derive(Error, Debug)]
+enum ClientError {
+    #[error("Failed to parse URL: {0}")]
+    UrlParse(#[from] url::ParseError),
+
+    #[error("Connection error: {0}")]
+    Connection(String),
+
+    #[error("WebSocket error: {0}")]
+    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+
+    #[error("IO error: {0}")]
+    Io(#[from] io::Error),
 }
 
-impl ServerState {
-    fn new() -> Self {
-        Self {
-            active_connections: 0,
-        }
-    }
-
-    fn increment_connections(&mut self) {
-        self.active_connections += 1;
-        println!(
-            "{} New connection established. Active connections: {}",
-            "📡".green(),
-            self.active_connections.to_string().yellow()
-        );
-    }
-
-    fn decrement_connections(&mut self) {
-        self.active_connections -= 1;
-        println!(
-            "{} Connection closed. Active connections: {}",
-            "🔌".yellow(),
-            self.active_connections.to_string().yellow()
-        );
-    }
+struct WebSocketClient {
+    url: String,
+    is_running: bool,
+    max_retries: u32,
+    retry_delay: Duration,
 }
 
-async fn handle_connection(
-    stream: tokio::net::TcpStream,
-    state: Arc<Mutex<ServerState>>,
-    mut shutdown_rx: broadcast::Receiver<()>,
-) {
-    let ws_stream = match accept_async(stream).await {
-        Ok(ws) => ws,
-        Err(e) => {
-            eprintln!(
-                "{} Failed to accept WebSocket connection: {}",
-                "❌".red(),
-                e.to_string().red()
-            );
-            return;
-        }
-    };
-
-    {
-        let mut state = state.lock().await;
-        state.increment_connections();
+impl WebSocketClient {
+    fn new(url: &str) -> Result<Self, ClientError> {
+        // Validate URL
+        let _ = Url::parse(url)?;
+        Ok(Self {
+            url: url.to_string(),
+            is_running: true,
+            max_retries: 5,
+            retry_delay: Duration::from_secs(2),
+        })
     }
 
-    let (mut write, mut read) = ws_stream.split();
-
-    loop {
-        tokio::select! {
-            // Handle incoming WebSocket messages
-            message = read.next() => {
-                match message {
-                    Some(Ok(msg)) => {
+    async fn attempt_connect(
+        &self,
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        ClientError,
+    > {
+        let mut retries = 0;
+        loop {
+            match connect_async(&self.url).await {
+                Ok((ws_stream, _)) => {
+                    if retries > 0 {
                         println!(
-                            "{} Received message: {}",
-                            "📩".cyan(),
-                            msg.to_string().bright_blue()
+                            "{} Successfully connected after {} {}!",
+                            "✅".green(),
+                            retries,
+                            if retries == 1 { "retry" } else { "retries" }
                         );
-                        if let Err(e) = write.send(msg).await {
+                    }
+                    return Ok(ws_stream);
+                }
+                Err(e) => {
+                    retries += 1;
+                    if retries > self.max_retries {
+                        return Err(ClientError::Connection(format!(
+                            "Failed to connect after {} retries: {}",
+                            self.max_retries, e
+                        )));
+                    }
+
+                    eprintln!(
+                        "{} Connection attempt {} failed: {}",
+                        "⚠️".yellow(),
+                        retries,
+                        e
+                    );
+                    println!(
+                        "{} Retrying in {} seconds... ({}/{})",
+                        "🔄".cyan(),
+                        self.retry_delay.as_secs(),
+                        retries,
+                        self.max_retries
+                    );
+
+                    sleep(self.retry_delay).await;
+                }
+            }
+        }
+    }
+
+    async fn connect(&mut self) -> Result<(), ClientError> {
+        println!(
+            "\n{} Connecting to WebSocket server...",
+            "🚀".bright_green()
+        );
+        println!(
+            "{} Target server: {}",
+            "🎯".bright_cyan(),
+            self.url.bright_blue()
+        );
+        println!(
+            "{} Press {} to disconnect\n",
+            "👋".bright_yellow(),
+            "Ctrl+C".bright_red()
+        );
+
+        let ws_stream = self.attempt_connect().await?;
+        println!("{} Connected to server", "✨".bright_green());
+
+        let (mut write, mut read) = ws_stream.split();
+        let (tx, mut rx) = mpsc::channel(32);
+
+        // Clone channel for the message sending task
+        let tx_clone = tx.clone();
+
+        // Handle Ctrl+C
+        tokio::spawn(async move {
+            if let Ok(()) = tokio::signal::ctrl_c().await {
+                println!("\n\n{} Initiating graceful shutdown...", "🛑".bright_red());
+                let _ = tx_clone.send(None).await;
+            }
+        });
+
+        // Send periodic messages
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let message = format!(
+                    "Hello from Rust client! Time: {:?}",
+                    std::time::SystemTime::now()
+                );
+                if tx_clone.send(Some(message)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Main event loop
+        while self.is_running {
+            tokio::select! {
+                // Handle incoming messages
+                Some(msg) = read.next() => {
+                    match msg {
+                        Ok(msg) => {
+                            println!(
+                                "{} Received: {}",
+                                "📩".cyan(),
+                                msg.to_string().bright_blue()
+                            );
+                        }
+                        Err(e) => {
                             eprintln!(
-                                "{} Error sending message: {}",
+                                "{} Error receiving message: {}",
                                 "❌".red(),
                                 e.to_string().red()
                             );
                             break;
                         }
                     }
-                    Some(Err(e)) => {
-                        eprintln!(
-                            "{} Error receiving message: {}",
-                            "❌".red(),
-                            e.to_string().red()
-                        );
-                        break;
-                    }
-                    None => {
-                        println!("{} Client disconnected", "🔄".yellow());
-                        break;
+                }
+                // Handle outgoing messages
+                Some(msg) = rx.recv() => {
+                    match msg {
+                        Some(text) => {
+                            println!("{} Sending: {}", "📤".green(), text.bright_blue());
+                            if let Err(e) = write.send(Message::Text(text.into())).await {
+                                eprintln!(
+                                    "{} Error sending message: {}",
+                                    "❌".red(),
+                                    e.to_string().red()
+                                );
+                                break;
+                            }
+                        }
+                        None => {
+                            println!("{} Disconnecting from server...", "🔌".yellow());
+                            self.is_running = false;
+                        }
                     }
                 }
             }
-            // Handle shutdown signal
-            _ = shutdown_rx.recv() => {
-                println!("{} Received shutdown signal, closing connection...", "🛑".red());
-                break;
-            }
         }
-    }
 
-    {
-        let mut state = state.lock().await;
-        state.decrement_connections();
+        // Cleanup and exit
+        sleep(Duration::from_secs(1)).await;
+        println!("{} Goodbye!\n", "👋".bright_yellow());
+        Ok(())
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n{} Starting WebSocket server...", "🚀".bright_green());
-
-    // Create a TCP listener
-    let listener = TcpListener::bind("127.0.0.1:8080").await?;
-    println!(
-        "{} Server is listening on {}",
-        "✨".bright_cyan(),
-        "ws://127.0.0.1:8080".bright_blue()
-    );
-    println!(
-        "{} Press {} to shutdown gracefully\n",
-        "👋".bright_yellow(),
-        "Ctrl+C".bright_red()
-    );
-
-    // Setup shutdown channel
-    let (shutdown_tx, _) = broadcast::channel::<()>(1);
-    let shutdown_tx_clone = shutdown_tx.clone();
-
-    // Setup server state
-    let state = Arc::new(Mutex::new(ServerState::new()));
-    let running = Arc::new(Mutex::new(true));
-    let running_clone = running.clone();
-
-    // Handle Ctrl+C
-    tokio::spawn(async move {
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => {
-                println!(
-                    "\n\n{} Initiating graceful shutdown...",
-                    "🛑".bright_red().bold()
-                );
-
-                // Send shutdown signal
-                let _ = shutdown_tx_clone.send(());
-
-                // Set running flag to false
-                let mut running = running_clone.lock().await;
-                *running = false;
-
-                // Give connections time to close gracefully
-                sleep(Duration::from_secs(1)).await;
-                println!("{} Goodbye!\n", "👋".bright_yellow());
-                std::process::exit(0);
-            }
-            Err(e) => {
-                eprintln!(
-                    "{} Error setting up Ctrl+C handler: {}",
-                    "❌".red(),
-                    e.to_string().red()
-                );
-            }
+async fn main() {
+    match run().await {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("\n{} Error: {}\n", "❌".red().bold(), e.to_string().red());
+            std::process::exit(1);
         }
-    });
-
-    // Accept incoming connections
-    while let Ok((stream, addr)) = listener.accept().await {
-        // Check if we should continue accepting connections
-        let running = running.lock().await;
-        if !*running {
-            break;
-        }
-        drop(running);
-
-        println!(
-            "{} New connection from: {}",
-            "🌟".bright_green(),
-            addr.to_string().bright_blue()
-        );
-
-        let state = Arc::clone(&state);
-        let shutdown_rx = shutdown_tx.subscribe();
-
-        tokio::spawn(async move {
-            handle_connection(stream, state, shutdown_rx).await;
-        });
     }
+}
 
+async fn run() -> Result<(), ClientError> {
+    let mut client = WebSocketClient::new("ws://127.0.0.1:8080")?;
+    client.connect().await?;
     Ok(())
 }

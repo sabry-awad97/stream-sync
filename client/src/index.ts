@@ -1,129 +1,90 @@
-import WebSocket from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 
-class WebSocketClient {
-  private ws: WebSocket | null = null;
-  private reconnectAttempts = 0;
-  private readonly maxReconnectAttempts = 3;
-  private readonly reconnectDelay = 2000; // 2 seconds
-  private isShuttingDown = false;
+class WebSocketServerApp {
+  private wss: WebSocketServer;
+  private clients: Set<WebSocket>;
+  private isShuttingDown: boolean;
 
-  constructor(private readonly url: string) {
-    // Setup graceful shutdown
+  constructor(private readonly port: number) {
+    this.wss = new WebSocketServer({ port });
+    this.clients = new Set();
+    this.isShuttingDown = false;
+    this.setupShutdown();
+  }
+
+  public start(): void {
+    console.log("\n🚀 Starting WebSocket server...");
+    console.log(`✨ Server is listening on ws://127.0.0.1:${this.port}`);
+    console.log("👋 Press Ctrl+C to shutdown gracefully\n");
+
+    this.wss.on("listening", () => {
+      console.log("🎯 WebSocket server is ready for connections");
+    });
+
+    this.wss.on("connection", (ws: WebSocket, req) => {
+      this.handleConnection(ws, req);
+    });
+
+    this.wss.on("error", (error: Error) => {
+      console.error("❌ Server error:", error.message);
+    });
+  }
+
+  private handleConnection(ws: WebSocket, req: any): void {
+    const clientAddress = req.socket.remoteAddress;
+    console.log("📡 New connection from:", clientAddress);
+
+    this.clients.add(ws);
+    console.log(`🌟 Active connections: ${this.clients.size}`);
+
+    ws.on("message", (message: Buffer) => {
+      try {
+        const messageStr = message.toString();
+        console.log("📩 Received:", messageStr);
+
+        // Echo the message back
+        ws.send(messageStr);
+        console.log("📤 Sent:", messageStr);
+      } catch (error) {
+        console.error("❌ Error processing message:", (error as Error).message);
+      }
+    });
+
+    ws.on("close", () => {
+      this.clients.delete(ws);
+      console.log("🔌 Client disconnected");
+      console.log(`🌟 Active connections: ${this.clients.size}`);
+    });
+
+    ws.on("error", (error: Error) => {
+      console.error("❌ Client error:", error.message);
+    });
+  }
+
+  private setupShutdown(): void {
     process.on("SIGINT", async () => {
-      await this.handleGracefulShutdown();
-    });
-  }
+      if (this.isShuttingDown) return;
+      this.isShuttingDown = true;
 
-  public async connect(): Promise<void> {
-    try {
-      this.ws = new WebSocket(this.url);
-      this.setupEventListeners();
-      await this.waitForConnection();
-      this.reconnectAttempts = 0;
-      console.log("\n🚀 Connected to WebSocket server");
-      console.log("👋 Press Ctrl+C to shutdown gracefully\n");
-    } catch (error) {
-      await this.handleConnectionError(error as Error);
-    }
-  }
+      console.log("\n\n🛑 Initiating graceful shutdown...");
 
-  private setupEventListeners(): void {
-    if (!this.ws) return;
-
-    this.ws.on("open", () => {
-      this.sendTestMessage();
-    });
-
-    this.ws.on("message", (data) => {
-      console.log("📩 Received:", data.toString());
-    });
-
-    this.ws.on("close", async () => {
-      if (this.isShuttingDown) {
-        console.log("🔌 Connection closed gracefully");
-        return;
+      // Close all client connections
+      for (const client of this.clients) {
+        client.close();
       }
 
-      console.log("⚠️ Connection lost");
-      await this.attemptReconnect();
-    });
+      // Wait for connections to close
+      await new Promise((resolve) => setTimeout(resolve, 1000));
 
-    this.ws.on("error", (error) => {
-      console.error("❌ WebSocket error:", (error as Error).message);
-    });
-  }
-
-  private async waitForConnection(): Promise<void> {
-    if (!this.ws) throw new Error("WebSocket instance not initialized");
-
-    return new Promise((resolve, reject) => {
-      const timeoutId = setTimeout(() => {
-        reject(new Error("Connection timeout"));
-      }, 5000);
-
-      this.ws!.once("open", () => {
-        clearTimeout(timeoutId);
-        resolve();
-      });
-
-      this.ws!.once("error", (error) => {
-        clearTimeout(timeoutId);
-        reject(error);
+      // Close the server
+      this.wss.close(() => {
+        console.log("👋 Server shut down gracefully");
+        process.exit(0);
       });
     });
-  }
-
-  private async handleConnectionError(error: Error): Promise<void> {
-    console.error("❌ Connection error:", error.message);
-    await this.attemptReconnect();
-  }
-
-  private async attemptReconnect(): Promise<void> {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error("❌ Max reconnection attempts reached. Exiting...");
-      process.exit(1);
-    }
-
-    this.reconnectAttempts++;
-    console.log(
-      `🔄 Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`
-    );
-
-    await new Promise((resolve) => setTimeout(resolve, this.reconnectDelay));
-    await this.connect();
-  }
-
-  private sendTestMessage(): void {
-    if (!this.ws) return;
-
-    const message = "Hello from TypeScript client!";
-    this.ws.send(message);
-    console.log("📤 Sent:", message);
-  }
-
-  private async handleGracefulShutdown(): Promise<void> {
-    if (this.isShuttingDown) return;
-    this.isShuttingDown = true;
-
-    console.log("\n\n🛑 Initiating graceful shutdown...");
-
-    if (this.ws) {
-      this.ws.close();
-      await new Promise((resolve) => setTimeout(resolve, 1000)); // Give time for the close event to be processed
-    }
-
-    console.log("👋 Goodbye!");
-    process.exit(0);
   }
 }
 
-// Start the client
-const client = new WebSocketClient("ws://127.0.0.1:8080");
-client.connect().catch((error: unknown) => {
-  if (error instanceof Error) {
-    console.error("❌ Failed to start client:", error.message);
-  } else {
-    console.error("❌ Failed to start client:", error);
-  }
-  process.exit(1);
-});
+// Start the server
+const server = new WebSocketServerApp(8080);
+server.start();
